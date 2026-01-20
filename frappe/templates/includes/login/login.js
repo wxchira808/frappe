@@ -36,11 +36,86 @@ login.bind_events = function () {
 		args.email = ($("#signup_email").val() || "").trim();
 		args.redirect_to = frappe.utils.sanitise_redirect(frappe.utils.get_url_arg("redirect-to"));
 		args.full_name = frappe.utils.xss_sanitise(($("#signup_fullname").val() || "").trim());
+
+		// password fields
+		var pwd = $("#signup_password").val() || "";
+		var pwd_confirm = $("#signup_password_confirm").val() || "";
+
 		if (!args.email || !validate_email(args.email) || !args.full_name) {
-			login.set_status({{ _("Valid email and name required") | tojson }}, 'red');
+			login.set_status({{ "Valid email and name required" | tojson }}, 'red');
 			return false;
 		}
-		login.call(args);
+
+		if (!pwd) {
+			login.set_status({{ "Password required" | tojson }}, 'red');
+			return false;
+		}
+
+		if (pwd !== pwd_confirm) {
+			login.set_status({{ "Passwords do not match" | tojson }}, 'red');
+			return false;
+		}
+
+		// server-side password strength check
+		frappe.call({
+			nowait: true,
+			method: 'frappe.core.doctype.user.user.test_password_strength',
+			args: { new_password: pwd },
+			callback: function(r) {
+				if (r.message && r.message.feedback && r.message.feedback.password_policy_validation_passed === false) {
+					var fb = r.message.feedback;
+					var msg = (fb.warning || '') + '\n' + (fb.suggestions || []).join('\n');
+					login.set_status(msg, 'red');
+					return;
+				}
+
+				args.password = pwd;
+				login.call(args).then(function (r) {
+					if (r.message && r.message.status === "success") {
+						// Check if user was auto-logged in during signup
+						if (r.message.message === "Logged In") {
+							frappe.msgprint({
+								title: __("Success"),
+								message: __("Account created and you are now logged in!"),
+								indicator: "green",
+							});
+							$(".form-signup").trigger("reset");
+							login.set_status('Redirecting to dashboard...', 'green');
+							// Redirect to home/dashboard after auto-login
+							setTimeout(() => {
+								window.location.href = frappe.utils.sanitise_redirect(frappe.utils.get_url_arg("redirect-to")) || "/";
+							}, 2000);
+						} else {
+							frappe.msgprint({
+								title: __("Success"),
+								message: r.message.message,
+								indicator: "green",
+							});
+							$(".form-signup").trigger("reset");
+							login.set_status('Redirecting to login...', 'green');
+							// Redirect to login page if not auto-logged in
+							setTimeout(() => {
+								window.location.href = "/login";
+							}, 3000);
+						}
+					} else {
+						// fallback for other cases, maybe show an error from server
+						let error_message = __("An unknown error occurred.");
+						if (r.message && typeof r.message === 'string') {
+							error_message = r.message;
+						} else if (r._server_messages) {
+							try {
+								// server messages are stringified JSON array
+								error_message = JSON.parse(r._server_messages).join('<br>');
+							} catch (e) {
+								// pass, use default
+							}
+						}
+						login.set_status(error_message, 'red');
+					}
+				});
+			}
+		});
 		return false;
 	});
 

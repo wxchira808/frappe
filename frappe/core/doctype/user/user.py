@@ -970,8 +970,8 @@ def verify_password(password):
 	frappe.local.login_manager.check_password(frappe.session.user, password)
 
 
-@frappe.whitelist(allow_guest=True)
-def sign_up(email: str, full_name: str, redirect_to: str) -> tuple[int, str]:
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def sign_up(email: str, full_name: str, redirect_to: str = None, password: str = None) -> tuple[int, str]:
 	if is_signup_disabled():
 		frappe.throw(_("Sign Up is disabled"), title=_("Not Allowed"))
 
@@ -995,32 +995,61 @@ def sign_up(email: str, full_name: str, redirect_to: str) -> tuple[int, str]:
 
 		from frappe.utils import random_string
 
+		# create user without sending welcome/reset emails
 		user = frappe.get_doc(
 			{
 				"doctype": "User",
 				"email": email,
 				"first_name": escape_html(full_name),
 				"enabled": 1,
-				"new_password": random_string(10),
 				"user_type": "Website User",
 			}
 		)
 		user.flags.ignore_permissions = True
 		user.flags.ignore_password_policy = True
+		user.flags.no_welcome_mail = True
 		user.insert()
+
+		# If password provided, validate and set it. Otherwise, set a random password (no email).
+		new_password = password or random_string(10)
+		# Validate password strength if policy enabled
+		try:
+			if new_password:
+				_strength = test_password_strength(new_password)
+				feedback = _strength.get("feedback")
+				if feedback and not feedback.get("password_policy_validation_passed", False):
+					raise frappe.ValidationError("Invalid Password")
+		except Exception:
+			# If password fails, remove created user and re-raise as friendly message
+			frappe.db.rollback()
+			frappe.delete_doc("User", user.name, force=1)
+			raise
 
 		# set default signup role as per Portal Settings
 		default_role = frappe.get_single_value("Portal Settings", "default_role")
 		if default_role:
+			# reload user to pick up any DB-side changes from after_insert hooks
+			user.reload()
+			# add roles before any other updates to avoid timestamp mismatch on save
 			user.add_roles(default_role)
 
 		if redirect_to:
-			frappe.cache.hset("redirect_after_login", user.name, sanitize_redirect(redirect_to))
+			# cache redirect so post-login picks it up
+			frappe.cache.hset("redirect_after_login", user.name, redirect_to)
 
-		if user.flags.email_sent:
-			return 1, _("Please check your email for verification")
-		else:
-			return 2, _("Please ask your administrator to verify your sign-up")
+		# set password without sending emails and without logout
+		_update_password(user.name, new_password, doctype="User", fieldname="password", logout_all_sessions=False)
+
+		# Ensure no reset keys or welcome emails are queued
+		frappe.db.set_value("User", user.name, "reset_password_key", "")
+
+		# Auto-login the user
+		frappe.local.login_manager.login_as(user.name)
+
+		return {
+			"status": "success",
+			"message": "Logged In",
+		}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
